@@ -1,0 +1,17 @@
+[project]
+name = "auto-analyst"
+version = "0.1.0"
+description = "Pharmaceutical MMM analysis platform with AI-powered semantic search"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.136.1",
+    "uvicorn>=0.46.0",
+    "chromadb>=0.6.0",
+    "sentence-transformers>=3.0.0",
+    "litellm>=1.50.0",
+    "numpy>=1.26.0",
+    "tqdm>=4.66.0",
+    "pydantic>=2.0.0",
+    "gradio>=6.14.0",
+]
