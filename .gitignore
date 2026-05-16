@@ -11,11 +11,40 @@ wheels/
 
 # Secrets
 .env
+.env.*
+!.env.example
 
 # Generated data & vector store
 mmm_dummy_data/
 mmm_vectorstore/
 
+# Generated chart artifacts
+chart_outputs/
+
 # Notebook output artifacts
 iframe_figures/
 *.html
+.ipynb_checkpoints/
+
+# Test & coverage artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Linter/type-checker caches
+.ruff_cache/
+.mypy_cache/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Private audit documents
+docs/faang_audit.md

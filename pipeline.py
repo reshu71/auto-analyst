@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from litellm import completion
 
+# ─── Langfuse v4 (March 2026 release — OpenTelemetry-based) ──────
+from langfuse import observe, get_client, propagate_attributes
+
 from src.config import LLM_MODEL
 from src.db import get_collection
 from src.query_parser import mmm_retriever, load_known_entities
@@ -30,6 +33,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pipeline")
 
+# Get the global Langfuse client — uses LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY from .env
+langfuse = get_client()
+
 
 # ─── Pydantic Models ──────────────────────────────────────────────
 class SubTask(BaseModel):
@@ -43,23 +49,23 @@ class TaskPlan(BaseModel):
     reasoning: str
 
 class ChannelInsight(BaseModel):
-    channel:        str
-    current_roi:    float
-    benchmark_roi:  Optional[float]
+    channel:       str
+    current_roi:   float
+    benchmark_roi: Optional[float]
     recommendation: str
-    confidence:     str   # high / medium / low
+    confidence:    str
 
 class CopilotAnswer(BaseModel):
-    summary:         str
-    insights:        list[ChannelInsight]
-    narrative:       str
-    chart_type:      Optional[str]
-    sources:         list[str]
+    summary:    str
+    insights:   list[ChannelInsight]
+    narrative:  str
+    chart_type: Optional[str]
+    sources:    list[str]
 
 
 # ─── Tool Registry ────────────────────────────────────────────────
 def build_tool_registry(collection) -> dict:
-    known_brands, known_channels = load_known_entities(collection)
+    load_known_entities(collection)
 
     def _mmm_retriever(args: dict) -> str:
         return mmm_retriever(
@@ -125,15 +131,15 @@ def build_tool_registry(collection) -> dict:
         )
 
     return {
-        "mmm_retriever":              _mmm_retriever,
-        "benchmark_fetcher":          _benchmark_fetcher,
-        "scenario_simulator":         _scenario_simulator,
-        "roi_bar_chart":              _roi_bar_chart,
-        "spend_vs_revenue_chart":     _spend_vs_revenue_chart,
-        "revenue_waterfall_chart":    _revenue_waterfall_chart,
-        "scenario_bar_chart":         _scenario_bar_chart,
-        "benchmark_comparison_chart": _benchmark_comparison_chart,
-        "power_curve_chart":          _power_curve_chart,
+        "mmm_retriever":               _mmm_retriever,
+        "benchmark_fetcher":           _benchmark_fetcher,
+        "scenario_simulator":          _scenario_simulator,
+        "roi_bar_chart":               _roi_bar_chart,
+        "spend_vs_revenue_chart":      _spend_vs_revenue_chart,
+        "revenue_waterfall_chart":     _revenue_waterfall_chart,
+        "scenario_bar_chart":          _scenario_bar_chart,
+        "benchmark_comparison_chart":  _benchmark_comparison_chart,
+        "power_curve_chart":           _power_curve_chart,
     }
 
 
@@ -144,32 +150,32 @@ You are a planning agent for an MMM (Marketing Mix Modeling) copilot system.
 Your job is to break a user's analytics question into a sequence of tool calls.
 
 Available tools:
-- mmm_retriever         → retrieves relevant MMM data from the vector store
-                          args: { "question": str, "n_results": int }
-- benchmark_fetcher     → compares channel ROI vs industry benchmarks
-                          args single: { "channel": str, "sub_vertical": str, "current_roi": float }
-                          args batch:  { "channels": [{"name": str, "roi": float}], "sub_vertical": str }
-- scenario_simulator    → simulates budget change impact on revenue
-                          args single:    { "channel": str, "current_spend": float, "current_revenue_contribution": float, "budget_change_pct": float }
-                          args portfolio: { "channels": [...], "budget_changes": {"channel": pct} }
-- roi_bar_chart         → bar chart of ROI per channel
-                          args: { "channels": [...], "brand": str, "sub_vertical": str }
+- mmm_retriever          → retrieves relevant MMM data from the vector store
+                           args: { "question": str, "n_results": int }
+- benchmark_fetcher      → compares channel ROI vs industry benchmarks
+                           args single: { "channel": str, "sub_vertical": str, "current_roi": float }
+                           args batch:  { "channels": [{"name": str, "roi": float}], "sub_vertical": str }
+- scenario_simulator     → simulates budget change impact on revenue
+                           args single:    { "channel": str, "current_spend": float, "current_revenue_contribution": float, "budget_change_pct": float }
+                           args portfolio: { "channels": [...], "budget_changes": {"channel_name": pct} }
+- roi_bar_chart          → bar chart of ROI per channel
+                           args: { "channels": [...], "brand": str, "sub_vertical": str }
 - spend_vs_revenue_chart → scatter chart of spend vs revenue
-                          args: { "channels": [...], "brand": str }
-- revenue_waterfall_chart → waterfall chart of revenue decomposition
-                          args: { "model_summary": {...}, "channels": [...], "brand": str }
-- scenario_bar_chart    → before/after scenario chart
-                          args: { "scenario_results": [...] }
-- benchmark_comparison_chart → your ROI vs industry benchmarks chart
-                          args: { "benchmark_results": [...], "sub_vertical": str }
-- power_curve_chart     → diminishing returns curve for a channel
-                          args: { "channel": str, "current_spend": float, "current_revenue": float }
+                           args: { "channels": [...], "brand": str }
+- revenue_waterfall_chart → waterfall of revenue decomposition
+                           args: { "model_summary": {...}, "channels": [...], "brand": str }
+- scenario_bar_chart     → before/after scenario chart
+                           args: { "scenario_results": [...] }
+- benchmark_comparison_chart → your ROI vs industry benchmarks
+                           args: { "benchmark_results": [...], "sub_vertical": str }
+- power_curve_chart      → diminishing returns curve for a channel
+                           args: { "channel": str, "current_spend": float, "current_revenue": float }
 
 Rules:
-1. Always start with mmm_retriever to get the relevant MMM data
-2. Only include tools that are necessary for the question
-3. If the question mentions budget changes or scenarios — include scenario_simulator
-4. If the question asks for benchmarks or "how are we doing vs industry" — include benchmark_fetcher
+1. Always start with mmm_retriever to get relevant MMM data
+2. Only include tools necessary for the question
+3. If budget changes or scenarios are mentioned — include scenario_simulator
+4. If benchmarks or "vs industry" are mentioned — include benchmark_fetcher
 5. Always end with ONE chart that best visualises the answer
 6. Return ONLY valid JSON — no markdown, no explanation
 
@@ -183,8 +189,20 @@ Return format:
 }
 """
 
+# Key change in v4 — as_type="generation" auto-captures model, tokens, cost
+@observe(name="planner", as_type="generation")
 def run_planner(question: str) -> TaskPlan:
-    logger.info("Planner: generating task plan for question")
+    logger.info("Planner: generating task plan")
+
+    # In v4 — input and metadata go on get_client(), not langfuse_context
+    langfuse.update_current_generation(
+        input=[
+            {"role": "system", "content": PLANNER_SYSTEM},
+            {"role": "user",   "content": question},
+        ],
+        model=LLM_MODEL,
+    )
+
     response = completion(
         model=LLM_MODEL,
         messages=[
@@ -192,69 +210,141 @@ def run_planner(question: str) -> TaskPlan:
             {"role": "user",   "content": question},
         ],
     )
+
     raw = response.choices[0].message.content.strip()
     raw = re.sub(r"```json|```", "", raw).strip()
 
     try:
         parsed = json.loads(raw)
-        plan = TaskPlan(**parsed)
-        logger.info(
-            "Planner: objective=%r | subtasks=%d | reasoning=%r",
-            plan.objective, len(plan.subtasks), plan.reasoning,
-        )
+        plan   = TaskPlan(**parsed)
+
+        logger.info("Planner: objective=%r | subtasks=%d", plan.objective, len(plan.subtasks))
         for i, s in enumerate(plan.subtasks, 1):
             logger.info("  step %d: %s → %s", i, s.task, s.tool_name)
+
+        # v4 — pass usage_details for token tracking (replaces old "usage" field)
+        langfuse.update_current_generation(
+            output=raw,
+            usage_details={
+                "input":  response.usage.prompt_tokens,
+                "output": response.usage.completion_tokens,
+                "total":  response.usage.total_tokens,
+            },
+            metadata={
+                "objective":     plan.objective,
+                "reasoning":     plan.reasoning,
+                "num_subtasks":  len(plan.subtasks),
+                "tools_planned": [s.tool_name for s in plan.subtasks],
+            },
+        )
         return plan
+
     except Exception as e:
         logger.warning("Planner parse error (%s) — falling back to retrieval only", e)
-        return TaskPlan(
+        fallback = TaskPlan(
             objective=question,
-            reasoning="Fallback to retrieval only",
+            reasoning="Fallback to retrieval only due to parse error",
             subtasks=[SubTask(
                 task="Retrieve relevant MMM data",
                 tool_name="mmm_retriever",
                 tool_args={"question": question, "n_results": 8},
             )],
         )
+        langfuse.update_current_generation(
+            output=raw,
+            level="WARNING",
+            status_message=f"Parse error: {e}",
+            metadata={"fallback": True},
+        )
+        return fallback
+
+
+# ─── Single Tool Span ─────────────────────────────────────────────
+@observe()
+def _run_single_tool(subtask: SubTask, tool_registry: dict) -> dict:
+    """
+    Each tool runs as its own Langfuse span.
+    The span name is set dynamically to the tool name.
+    """
+    langfuse.update_current_span(
+        name=subtask.tool_name,
+        input=subtask.tool_args,
+    )
+
+    tool_fn = tool_registry.get(subtask.tool_name)
+
+    if not tool_fn:
+        err = f"ERROR: tool {subtask.tool_name!r} not registered"
+        logger.warning(err)
+        langfuse.update_current_span(
+            output={"error": err},
+            level="ERROR",
+            status_message=err,
+        )
+        return {"task": subtask.task, "tool_name": subtask.tool_name, "result": err}
+
+    try:
+        result = tool_fn(subtask.tool_args)
+
+        # don't log base64 chart blobs
+        is_chart   = "chart" in subtask.tool_name
+        output_log = (
+            "[chart base64 — not logged to Langfuse]"
+            if is_chart
+            else (str(result)[:500] + "…" if len(str(result)) > 500 else str(result))
+        )
+        langfuse.update_current_span(output=output_log)
+        return {"task": subtask.task, "tool_name": subtask.tool_name, "result": result}
+
+    except Exception as e:
+        err = f"ERROR: {e}"
+        logger.error("Tool %s raised: %s", subtask.tool_name, e)
+        langfuse.update_current_span(
+            output={"error": err},
+            level="ERROR",
+            status_message=err,
+        )
+        return {"task": subtask.task, "tool_name": subtask.tool_name, "result": err}
 
 
 # ─── Executor ─────────────────────────────────────────────────────
+@observe(name="executor")
 def run_executor(plan: TaskPlan, tool_registry: dict) -> list[dict]:
-    """Pure Python loop — no LLM calls. Runs each subtask, collects results."""
+    """
+    Pure Python loop — no LLM calls.
+    Each tool becomes a nested span via _run_single_tool.
+    """
+    langfuse.update_current_span(
+        input={
+            "objective": plan.objective,
+            "subtasks":  [{"task": s.task, "tool_name": s.tool_name} for s in plan.subtasks],
+        }
+    )
+
     execution_log = []
-    n = len(plan.subtasks)
-
     for i, subtask in enumerate(plan.subtasks, 1):
-        logger.info("[%d/%d] executing %r via %s", i, n, subtask.task, subtask.tool_name)
+        logger.info("[%d/%d] %s → %s", i, len(plan.subtasks), subtask.task, subtask.tool_name)
+        entry = _run_single_tool(subtask, tool_registry)
+        execution_log.append(entry)
 
-        tool_fn = tool_registry.get(subtask.tool_name)
-        if not tool_fn:
-            logger.warning("Tool not found: %s", subtask.tool_name)
-            execution_log.append({
-                "task":      subtask.task,
-                "tool_name": subtask.tool_name,
-                "result":    f"ERROR: tool {subtask.tool_name!r} not registered",
-            })
-            continue
+        preview = str(entry["result"])
+        if len(preview) > 120:
+            preview = preview[:120] + "…"
+        logger.info("[%d/%d] done: %s", i, len(plan.subtasks), preview)
 
-        try:
-            result = tool_fn(subtask.tool_args)
-            # log a brief preview — avoid dumping huge base64 blobs
-            preview = str(result)[:120] + "…" if len(str(result)) > 120 else str(result)
-            logger.info("[%d/%d] done — result preview: %s", i, n, preview)
-            execution_log.append({
-                "task":      subtask.task,
-                "tool_name": subtask.tool_name,
-                "result":    result,
-            })
-        except Exception as e:
-            logger.error("[%d/%d] tool %s raised: %s", i, n, subtask.tool_name, e)
-            execution_log.append({
-                "task":      subtask.task,
-                "tool_name": subtask.tool_name,
-                "result":    f"ERROR: {e}",
-            })
+    errors = [
+        e["tool_name"] for e in execution_log
+        if isinstance(e["result"], str) and e["result"].startswith("ERROR")
+    ]
 
+    langfuse.update_current_span(
+        output={
+            "tools_executed": [e["tool_name"] for e in execution_log],
+            "num_results":    len(execution_log),
+            "errors":         errors,
+        },
+        level="WARNING" if errors else "DEFAULT",
+    )
     return execution_log
 
 
@@ -281,7 +371,7 @@ Return ONLY valid JSON in this exact format — no markdown, no backticks:
     }
   ],
   "narrative": "3-5 paragraph detailed analysis with specific numbers from the data",
-  "chart_type": "which chart was generated (roi_bar | waterfall | scenario | benchmark | scatter | power_curve | none)",
+  "chart_type": "roi_bar | waterfall | scenario | benchmark | scatter | power_curve | none",
   "sources": ["list of brands/models referenced in the answer"]
 }
 
@@ -292,8 +382,10 @@ Rules:
 - narrative should read like a consultant's written analysis
 """
 
+@observe(name="synthesizer", as_type="generation")
 def run_synthesizer(question: str, execution_log: list[dict]) -> dict:
     logger.info("Synthesizer: building context from %d tool results", len(execution_log))
+
     context_parts = []
     chart_b64     = None
 
@@ -304,17 +396,26 @@ def run_synthesizer(question: str, execution_log: list[dict]) -> dict:
         if "chart" in tool and isinstance(result, str) and len(result) > 200:
             chart_b64 = result
             context_parts.append(f"[{tool}]: Chart generated successfully")
-            logger.debug("Synthesizer: extracted chart from %s (%d bytes)", tool, len(result))
         else:
             result_str = json.dumps(result, indent=2) if isinstance(result, dict) else str(result)
             if len(result_str) > 3000:
                 result_str = result_str[:3000] + "\n… (truncated)"
-            context_parts.append(
-                f"[{entry['task']}]\nTool: {tool}\nResult:\n{result_str}"
-            )
+            context_parts.append(f"[{entry['task']}]\nTool: {tool}\nResult:\n{result_str}")
 
-    context = "\n\n---\n\n".join(context_parts)
-    user_message = f"Question: {question}\n\nTool Results:\n{context}\n\nSynthesize a complete answer using the data above."
+    context      = "\n\n---\n\n".join(context_parts)
+    user_message = (
+        f"Question: {question}\n\n"
+        f"Tool Results:\n{context}\n\n"
+        f"Synthesize a complete answer using the data above."
+    )
+
+    langfuse.update_current_generation(
+        input=[
+            {"role": "system", "content": SYNTHESIZER_SYSTEM},
+            {"role": "user",   "content": user_message},
+        ],
+        model=LLM_MODEL,
+    )
 
     response = completion(
         model=LLM_MODEL,
@@ -329,13 +430,10 @@ def run_synthesizer(question: str, execution_log: list[dict]) -> dict:
 
     try:
         answer = json.loads(raw)
-        logger.info(
-            "Synthesizer: answer generated — %d insights, chart_type=%s",
-            len(answer.get("insights", [])),
-            answer.get("chart_type"),
-        )
+        logger.info("Synthesizer: %d insights | chart_type=%s",
+                    len(answer.get("insights", [])), answer.get("chart_type"))
     except Exception as e:
-        logger.warning("Synthesizer JSON parse error (%s) — using raw text as narrative", e)
+        logger.warning("Synthesizer JSON parse error (%s) — raw text as narrative", e)
         answer = {
             "summary":    "Analysis complete.",
             "insights":   [],
@@ -344,27 +442,58 @@ def run_synthesizer(question: str, execution_log: list[dict]) -> dict:
             "sources":    [],
         }
 
+    langfuse.update_current_generation(
+        output=raw,
+        usage_details={
+            "input":  response.usage.prompt_tokens,
+            "output": response.usage.completion_tokens,
+            "total":  response.usage.total_tokens,
+        },
+        metadata={
+            "num_insights": len(answer.get("insights", [])),
+            "chart_type":   answer.get("chart_type"),
+            "sources":      answer.get("sources", []),
+            "has_chart":    chart_b64 is not None,
+        },
+    )
+
     answer["chart_b64"] = chart_b64
     return answer
 
 
 # ─── Full Pipeline ────────────────────────────────────────────────
+@observe(name="mmm_pipeline")
 def run(question: str, collection) -> dict:
     """
-    Full MMM Copilot pipeline:
-      1. run_planner()    — LLM call #1 → TaskPlan
-      2. run_executor()   — pure Python, no LLM, runs tools
-      3. run_synthesizer() — LLM call #2 → CopilotAnswer + chart_b64
+    Langfuse v4 trace structure:
+      mmm_pipeline                ← outer trace (span)
+        ├── planner               ← generation (tokens + cost auto-tracked)
+        ├── executor              ← span
+        │     ├── mmm_retriever   ← span
+        │     ├── benchmark_fetcher ← span
+        │     └── <chart tool>    ← span
+        └── synthesizer           ← generation (tokens + cost auto-tracked)
     """
+    langfuse.set_current_trace_io(input={"question": question})
+
     logger.info("=" * 60)
     logger.info("Pipeline start: %r", question)
     logger.info("=" * 60)
 
-    tool_registry = build_tool_registry(collection)
+    with propagate_attributes(tags=["pipeline", "mmm"]):
+        tool_registry = build_tool_registry(collection)
+        plan          = run_planner(question)
+        execution_log = run_executor(plan, tool_registry)
+        answer        = run_synthesizer(question, execution_log)
 
-    plan          = run_planner(question)
-    execution_log = run_executor(plan, tool_registry)
-    answer        = run_synthesizer(question, execution_log)
+    langfuse.set_current_trace_io(
+        output={
+            "summary":      answer.get("summary", ""),
+            "chart_type":   answer.get("chart_type"),
+            "num_insights": len(answer.get("insights", [])),
+            "sources":      answer.get("sources", []),
+        }
+    )
 
     logger.info("Pipeline complete")
     return answer
@@ -383,9 +512,9 @@ def print_answer(answer: dict) -> None:
         print(f"{'='*60}")
         for ins in answer["insights"]:
             print(f"\n  {ins['channel'].upper()}")
-            print(f"    Current ROI  : {ins.get('current_roi', 'N/A')}x")
-            print(f"    Benchmark ROI: {ins.get('benchmark_roi', 'N/A')}x")
-            print(f"    Confidence   : {ins.get('confidence', '')}")
+            print(f"    Current ROI   : {ins.get('current_roi', 'N/A')}x")
+            print(f"    Benchmark ROI : {ins.get('benchmark_roi', 'N/A')}x")
+            print(f"    Confidence    : {ins.get('confidence', '')}")
             print(f"    Recommendation: {ins.get('recommendation', '')}")
 
     print(f"\n{'='*60}")
@@ -395,7 +524,7 @@ def print_answer(answer: dict) -> None:
 
     if answer.get("chart_b64"):
         print(f"\n{'='*60}")
-        print(f"CHART: {answer.get('chart_type', 'generated')} (base64 available)")
+        print(f"CHART: {answer.get('chart_type', 'generated')} (base64 ready for UI)")
         print(f"{'='*60}")
 
     if answer.get("sources"):
@@ -416,3 +545,6 @@ if __name__ == "__main__":
         answer = run(q, collection)
         print_answer(answer)
         print("\n\n")
+
+    # v4 — important for short-lived scripts — flushes events before exit
+    langfuse.flush()
