@@ -1,227 +1,214 @@
-# Architecture — AutoAnalyst MMM Copilot
+# MMM Copilot — System Architecture
 
 ## Overview
 
-AutoAnalyst is a two-LLM-call, three-stage pipeline wrapped in a dual interface (Gradio UI + FastAPI). Each question triggers:
-
-1. **Planner** — LLM decides which tools to call and in what order
-2. **Executor** — Pure Python runs those tools (no LLM)
-3. **Synthesizer** — LLM converts tool results into a structured analyst-style answer
-
-This pattern keeps reasoning separated from execution. The executor has no LLM dependency, making it fast, deterministic, and easy to test.
+A pharma Marketing Mix Modeling (MMM) copilot that answers commercial analytics questions using a three-stage AI pipeline: plan → execute → synthesize. The system combines vector-search over MMM model outputs with rule-based simulators and benchmark databases, all instrumented with Langfuse v4 distributed tracing.
 
 ---
 
-## Component Map
+## High-Level Flow
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                        Interfaces                        │
-│                                                          │
-│   app.py (Gradio)          main.py (FastAPI)            │
-│   • /question textbox      • POST /analyze               │
-│   • streaming status       • POST /query                 │
-│   • markdown output        • GET  /health                │
-│   • image chart            • Pydantic request/response   │
-└────────────────┬────────────────────┬────────────────────┘
-                 │                    │
-                 └────────┬───────────┘
-                          │  pipeline.run(question, collection)
-                          ▼
-┌──────────────────────────────────────────────────────────┐
-│                     pipeline.py                          │
-│                                                          │
-│  run_planner(question) → TaskPlan                        │
-│    └─ LiteLLM call → JSON → Pydantic TaskPlan            │
-│                                                          │
-│  run_executor(plan, tool_registry) → execution_log       │
-│    └─ Pure Python loop, no LLM                           │
-│    └─ Calls each tool function in order                  │
-│                                                          │
-│  run_synthesizer(question, execution_log) → dict         │
-│    └─ LiteLLM call → JSON → CopilotAnswer                │
-└──────────────────────────────────────────────────────────┘
-          │
-          ▼ tool_registry
-┌──────────────────────────────────────────────────────────┐
-│                      src/ modules                        │
-│                                                          │
-│  db.py              ChromaDB init, embedding function    │
-│  query_parser.py    mmm_retriever (regex + LLM fallback) │
-│  benchmark_fetcher  benchmark_fetcher, benchmark_all     │
-│  scenario_simulator scenario_simulator, simulate_portfolio│
-│  chart_generator    6 chart functions → base64 PNG       │
-└──────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌──────────────────────────────────────────────────────────┐
-│               Data & Infrastructure                      │
-│                                                          │
-│  mmm_vectorstore/   ChromaDB persistent files            │
-│  mmm_dummy_data/    50 synthetic MMM JSON model outputs  │
-│  .env               LLM API keys (never committed)       │
-└──────────────────────────────────────────────────────────┘
+User Question
+     │
+     ▼
+┌─────────────┐      LLM (litellm)
+│   Planner   │ ──────────────────► TaskPlan (ordered SubTask list)
+└─────────────┘
+     │
+     ▼
+┌─────────────┐
+│  Executor   │ ── loops over SubTasks ──► Tool Registry
+└─────────────┘                                │
+     │                        ┌────────────────┴──────────────────┐
+     │                        │                                   │
+     │                  mmm_retriever                   benchmark_fetcher
+     │                  (agentic RAG)                  scenario_simulator
+     │                        │                           chart_*
+     ▼
+┌─────────────┐      LLM (litellm)
+│ Synthesizer │ ──────────────────► CopilotAnswer (JSON)
+└─────────────┘
+     │
+     ▼
+  Answer + Chart (base64 PNG)
 ```
 
 ---
 
-## Pipeline Detail
+## Components
 
-### Stage 1 — Planner
+### `pipeline.py` — Core Pipeline
 
-**Input**: user question (string)  
-**Output**: `TaskPlan` (Pydantic model)
+The main entry point. Exposes `run(question, collection)` which:
+
+1. Builds the tool registry bound to the current ChromaDB collection
+2. Calls `run_planner()` → `TaskPlan`
+3. Calls `run_executor()` → `list[dict]` execution log
+4. Calls `run_synthesizer()` → `dict` answer
+
+Every function is wrapped with `@observe` (Langfuse v4) — planner and synthesizer are `as_type="generation"` (token tracking); executor and tools are spans.
+
+**Pydantic Models:**
+- `SubTask` — `{ task, tool_name, tool_args }`
+- `TaskPlan` — `{ objective, subtasks, reasoning }`
+- `ChannelInsight` — per-channel ROI + benchmark + recommendation
+- `CopilotAnswer` — `{ summary, insights, narrative, chart_type, sources }`
+
+---
+
+### `src/agentic_retriver.py` — Iterative RAG Retriever
+
+Replaces single-shot embedding lookup with a 3-step loop (up to `max_retries`):
+
+1. **Query rewriter** — LLM rewrites the question as a dense keyword string optimised for semantic search; on retry, targets the identified gap
+2. **Keyword check** — fast string matching to confirm retrieved chunks mention expected brands/channels/year
+3. **LLM-as-judge** — deep sufficiency check; if insufficient, updates gap and retries
+
+Falls back gracefully: returns best results seen, or a `did_you_mean` suggestion on zero results.
+
+**Key function:** `agentic_retriever(question, collection, n_results=10, max_retries=3)`
+
+---
+
+### `src/query_parser.py` — Filter Extraction
+
+Extracts structured ChromaDB `where` filters from free-text questions.
+
+- `regex_parser` — fast brand/channel/year/vertical detection via regex
+- `llm_parser` — fallback LLM call when regex finds nothing
+- `build_where_clause(filters, question)` — converts filters to ChromaDB `$and`/`$eq`/`$in` syntax; appends `{"type": "summary"}` for model-level questions
+
+---
+
+### `src/benchmark_fetcher.py` — Industry Benchmarks
+
+Static lookup table of ROI benchmark ranges (low / mid / 75th pct / high) for 14 channels × 3 sub-verticals (oncology / vaccines / pharma), sourced from 100+ pharma MMM studies.
+
+- `benchmark_fetcher(channel, sub_vertical, current_roi=None)` — single channel
+- `benchmark_all_channels(channels, sub_vertical)` — batch
+
+When `current_roi` is omitted the function returns ranges only; the Synthesizer performs the comparison against retrieved brand ROI.
+
+---
+
+### `src/scenario_simulator.py` — Budget Simulation
+
+Power-curve model: `new_revenue = current_revenue × (new_spend / current_spend) ^ exponent`
+
+Exponents are calibrated per channel (0.3 for Salesforce calls, 0.8 for paid search). Provides before/after spend, revenue, ROI, and a plain-English efficiency note.
+
+- `scenario_simulator(input_json)` — single channel
+- `simulate_portfolio(channels, budget_changes)` — multi-channel with blended ROI
+
+---
+
+### `src/chart_generator.py` — Visualisation
+
+Six chart types, all rendered server-side (Matplotlib Agg) and returned as base64 PNG strings:
+
+| Function | Chart type |
+|---|---|
+| `roi_bar_chart` | Horizontal bar — ROI per channel |
+| `spend_vs_revenue_chart` | Scatter — spend vs revenue contribution |
+| `revenue_waterfall_chart` | Waterfall — revenue decomposition |
+| `scenario_bar_chart` | Grouped bar — before/after scenario |
+| `benchmark_comparison_chart` | Grouped bar — brand ROI vs industry benchmarks |
+| `power_curve_chart` | Line — diminishing returns curve |
+
+HCP channels render in blue (`#2563EB`), consumer channels in teal (`#0D9488`), against a dark background (`#0F172A`).
+
+---
+
+### `src/db.py` — Vector Store
+
+Thin wrapper around ChromaDB's `PersistentClient`. Creates or connects to a `sentence-transformers/all-MiniLM-L6-v2` embedded collection at `./mmm_vectorstore`.
+
+---
+
+### `src/embedder.py` — Data Ingestion
+
+Chunks MMM JSON output files from `mmm_dummy_data/` into two chunk types per brand-year:
+- **summary** — model-level metrics (R², MAPE, base/incremental split)
+- **channel** — per-channel metrics (spend, ROI, reach, tactics)
+
+Skips already-ingested IDs; idempotent.
+
+---
+
+### `src/graph/` — LangGraph Pipeline
+
+An alternative execution layer that wraps the core pipeline in a LangGraph `StateGraph` for human-in-the-loop approval and checkpointing.
+
+```
+planner ──► human_approval ──(approve)──► executor ──► synthesizer ──► END
+                            ──(reject) ──► rejected                 ──► END
+```
+
+**Files:**
+- `state.py` — `MMMGraphState` (TypedDict with reducers) + `GraphConfig`
+- `nodes.py` — one function per node; calls pipeline functions internally
+- `routing.py` — pure predicate functions for conditional edges
+- `graph.py` — `build_graph_with_approval()` and `build_graph_silent()` factories
+- `runner.py` — `run_with_approval()` and `run_silent()` entry points (SQLite checkpointer)
+
+---
+
+### `src/config.py` — Global Constants
 
 ```python
-class SubTask(BaseModel):
-    task:      str       # plain English description
-    tool_name: str       # name matching tool_registry key
-    tool_args: dict      # args passed verbatim to the tool
-
-class TaskPlan(BaseModel):
-    objective: str
-    subtasks:  list[SubTask]
-    reasoning: str
-```
-
-The planner system prompt lists all 9 available tools with their argument schemas. Key rules enforced in the prompt:
-- Always start with `mmm_retriever`
-- Include `scenario_simulator` only if the question involves budget changes
-- Include `benchmark_fetcher` only if the question asks about industry comparison
-- End with exactly one chart tool
-
-**Fallback**: if LLM output is not valid JSON, falls back to a single `mmm_retriever` call.
-
-### Stage 2 — Executor
-
-**Input**: `TaskPlan`, `tool_registry` dict  
-**Output**: `execution_log` (list of dicts: task, tool_name, result)
-
-Pure Python loop — no LLM calls. Each subtask:
-1. Looks up the tool function by `tool_name`
-2. Calls `tool_fn(subtask.tool_args)`
-3. Appends result to the log
-
-Chart tools return base64-encoded PNG strings. All other tools return dicts or strings.
-
-Errors are caught per-subtask and logged as `ERROR: ...` strings so the synthesizer can acknowledge missing data gracefully.
-
-### Stage 3 — Synthesizer
-
-**Input**: original question, `execution_log`  
-**Output**: `CopilotAnswer` dict + `chart_b64`
-
-Builds a context string from all tool results (truncated at 3000 chars each to stay within context limits). Chart base64 blobs are extracted separately and passed through outside the LLM context.
-
-Returns structured JSON matching `CopilotAnswer`:
-```python
-class CopilotAnswer(BaseModel):
-    summary:   str                  # 2-3 sentence executive summary
-    insights:  list[ChannelInsight] # per-channel ROI comparison table
-    narrative: str                  # 3-5 paragraph detailed analysis
-    chart_type: Optional[str]       # which chart was generated
-    sources:   list[str]            # brands referenced
+MODEL_NAME       = "sentence-transformers/all-MiniLM-L6-v2"
+COLLECTION_NAME  = "mmm_outputs"
+VECTORSTORE_PATH = "./mmm_vectorstore"
+LLM_MODEL        = "gemini/gemini-3.1-flash-lite"
 ```
 
 ---
 
-## Query Parser
+## Observability — Langfuse v4
 
-Two-stage query filter extraction (`src/query_parser.py`):
+Every pipeline run produces a nested trace:
 
 ```
-Question → regex_parser() → filters dict
-                │
-                ├── found filters? → use them → build_where_clause() → ChromaDB where
-                │
-                └── empty? → llm_parser() → same filters dict → build_where_clause()
+mmm_pipeline  [trace]
+  ├── planner       [generation]  model + token + cost auto-tracked
+  ├── executor      [span]
+  │     ├── mmm_retriever          [span]
+  │     ├── benchmark_fetcher      [span]
+  │     └── <chart tool>           [span]
+  └── synthesizer   [generation]  model + token + cost auto-tracked
 ```
 
-Filters extracted: `brands`, `year`, `channel`, `category` (hcp/consumer), `sub_vertical` (oncology/vaccines/pharma).
+Key methods used:
+- `langfuse.update_current_generation(input, output, model, usage_details, metadata)`
+- `langfuse.update_current_span(name, input, output, level, status_message)`
+- `langfuse.set_current_trace_io(input, output)`
+- `propagate_attributes(tags=[...])` — attaches `["pipeline", "mmm"]` tags to all child spans
 
-The `build_where_clause` function converts these into ChromaDB `$eq`/`$in`/`$and` filter syntax.
-
----
-
-## Vector Store
-
-**Engine**: ChromaDB (persistent, local)  
-**Embedding model**: `sentence-transformers/all-MiniLM-L6-v2` (384-dim)  
-**Collection**: `mmm_outputs`  
-**Document count**: ~50 MMM model JSON outputs, each split into one document per channel
-
-Each document metadata includes: `brand`, `sub_vertical`, `year`, `channel`, `category`, `type`.
-
-The collection is loaded once at startup and passed through the call chain to avoid re-initialization per request.
+Chart base64 blobs are intentionally excluded from Langfuse output to avoid bloating the trace.
 
 ---
 
-## Benchmark & Scenario Data
+## Data Flow — Vector Store
 
-### Benchmarks (`src/benchmark_fetcher.py`)
-
-Static lookup table: channel → sub_vertical → `{roi_low, roi_mid, roi_high, percentile_75}`.
-
-Covers 14 channels across oncology/vaccines/pharma. Source: aggregated from 80+ pharma MMM studies (2019–2024).
-
-The `benchmark_fetcher()` function returns a performance label (outperformer / average / underperformer), gap to median, gap to 75th percentile, and a plain-English insight string for the synthesizer.
-
-### Scenario Simulator (`src/scenario_simulator.py`)
-
-Uses a power curve model: `new_revenue = current_revenue × (new_spend / current_spend)^exponent`
-
-Power curve exponents per channel (lower = stronger diminishing returns):
-
-| Channel | Exponent | Interpretation |
-|---------|----------|---------------|
-| `paid_search` | 0.8 | Near-linear; scales efficiently |
-| `social`, `display`, `pulsepoint` | 0.6 | Moderate returns |
-| `doximity`, `medscape`, `sfmc`, `nexgen` | 0.5 | Standard diminishing returns |
-| `tv`, `streaming_tv` | 0.4 | Heavy saturation |
-| `salesforce_calls` | 0.3 | Strongest diminishing returns |
-
-Both single-channel and portfolio-level (multi-channel) simulation are supported.
+```
+mmm_dummy_data/*.json
+        │
+   embedder.py (chunk_mmm_file → ingest_all)
+        │
+   ChromaDB PersistentClient  (./mmm_vectorstore)
+        │
+   agentic_retriever  (query with where filters)
+        │
+   pipeline synthesizer
+```
 
 ---
 
-## Chart Types
+## Environment Variables Required
 
-All charts render via matplotlib with a dark theme (`#0F172A` background) and return base64-encoded PNG.
-
-| Function | Chart Type | Use Case |
-|----------|-----------|---------|
-| `roi_bar_chart` | Horizontal bar | ROI ranking across channels |
-| `spend_vs_revenue_chart` | Scatter (bubble = ROI) | Efficiency vs volume view |
-| `revenue_waterfall_chart` | Stacked waterfall | Revenue decomposition (base + incremental) |
-| `scenario_bar_chart` | Grouped bar | Before/after budget scenario |
-| `benchmark_comparison_chart` | Grouped bar (3 series) | Your ROI vs median vs 75th percentile |
-| `power_curve_chart` | Line + scatter | Diminishing returns curve with current position |
-
----
-
-## Configuration
-
-All tuneable constants live in `src/config.py`:
-
-| Constant | Default | Override via |
-|---------|---------|-------------|
-| `MODEL_NAME` | `sentence-transformers/all-MiniLM-L6-v2` | Edit config |
-| `COLLECTION_NAME` | `mmm_outputs` | Edit config |
-| `VECTORSTORE_PATH` | `./mmm_vectorstore` | Edit config |
-| `DATA_FOLDER` | `mmm_dummy_data` | Edit config |
-| `LLM_MODEL` | `gemini/gemini-3.1-flash-lite` | Edit config or `LLM_MODEL` env var |
-
-LiteLLM is used as the LLM abstraction layer, so `LLM_MODEL` can be set to any supported provider string (e.g., `openai/gpt-4o`, `anthropic/claude-3-5-sonnet-20241022`).
-
----
-
-## Known Limitations
-
-See `docs/faang_audit.md` for a full production-readiness audit. Key items:
-
-- LLM calls in FastAPI are synchronous (blocks event loop under concurrent load)
-- No authentication on API endpoints
-- No rate limiting
-- No test coverage
-- `LLM_MODEL` default references a non-existent model version — update to a valid model ID
-- Power curve exponents and benchmark data are hardcoded — no runtime config reload
+| Variable | Purpose |
+|---|---|
+| `LANGFUSE_PUBLIC_KEY` | Langfuse project public key |
+| `LANGFUSE_SECRET_KEY` | Langfuse project secret key |
+| `GEMINI_API_KEY` | Google Gemini API key (via litellm) |

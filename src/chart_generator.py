@@ -227,7 +227,10 @@ def benchmark_comparison_chart(benchmark_results: list, sub_vertical: str = "") 
         benchmark_results: list of dicts from benchmark_fetcher()
         sub_vertical:      for the title
     """
-    found = [b for b in benchmark_results if b["status"] == "found"]
+    found = [
+        b for b in benchmark_results
+        if b["status"] == "found" and b.get("current_roi") is not None
+    ]
     if not found:
         return ""
 
