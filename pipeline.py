@@ -9,10 +9,10 @@ from litellm import completion
 
 # ─── Langfuse v4 (March 2026 release — OpenTelemetry-based) ──────
 from langfuse import observe, get_client, propagate_attributes
-
+from src.agentic_retriver import agentic_retriever as mmm_retriever
 from src.config import LLM_MODEL
 from src.db import get_collection
-from src.query_parser import mmm_retriever, load_known_entities
+from src.query_parser import load_known_entities
 from src.benchmark_fetcher import benchmark_fetcher, benchmark_all_channels
 from src.scenario_simulator import scenario_simulator, simulate_portfolio
 from src.chart_generator import (
@@ -83,7 +83,7 @@ def build_tool_registry(collection) -> dict:
         return benchmark_fetcher(
             channel=args["channel"],
             sub_vertical=args.get("sub_vertical", "pharma"),
-            current_roi=args["current_roi"],
+            current_roi=args.get("current_roi"),
         )
 
     def _scenario_simulator(args: dict) -> dict:
@@ -152,9 +152,12 @@ Your job is to break a user's analytics question into a sequence of tool calls.
 Available tools:
 - mmm_retriever          → retrieves relevant MMM data from the vector store
                            args: { "question": str, "n_results": int }
-- benchmark_fetcher      → compares channel ROI vs industry benchmarks
-                           args single: { "channel": str, "sub_vertical": str, "current_roi": float }
-                           args batch:  { "channels": [{"name": str, "roi": float}], "sub_vertical": str }
+- benchmark_fetcher      → returns industry benchmark ROI ranges for a channel
+                           args single: { "channel": str, "sub_vertical": str }
+                           NOTE: do NOT include "current_roi" — the synthesizer will
+                           extract the actual ROI from mmm_retriever results and compare
+                           it against the benchmark ranges returned here.
+                           args batch:  { "channels": [{"name": str}], "sub_vertical": str }
 - scenario_simulator     → simulates budget change impact on revenue
                            args single:    { "channel": str, "current_spend": float, "current_revenue_contribution": float, "budget_change_pct": float }
                            args portfolio: { "channels": [...], "budget_changes": {"channel_name": pct} }
@@ -175,9 +178,11 @@ Rules:
 1. Always start with mmm_retriever to get relevant MMM data
 2. Only include tools necessary for the question
 3. If budget changes or scenarios are mentioned — include scenario_simulator
-4. If benchmarks or "vs industry" are mentioned — include benchmark_fetcher
+4. If benchmarks, "vs industry", underperforming channels, or ROI below a threshold are mentioned — always include benchmark_fetcher to provide industry context
 5. Always end with ONE chart that best visualises the answer
-6. Return ONLY valid JSON — no markdown, no explanation
+6. For cross-brand or multi-channel questions (e.g. "across oncology brands", "all channels"), use n_results=15 or higher in mmm_retriever
+7. sub_vertical must be one of: "oncology", "vaccines", "pharma". Infer it from the brand name if not stated — Keytruda/Lenvima/Lynparza/Qliftara/Welireg are oncology; Januvia/Dificid/Bridion/Belsomra are pharma
+8. Return ONLY valid JSON — no markdown, no explanation
 
 Return format:
 {
@@ -375,8 +380,12 @@ Return ONLY valid JSON in this exact format — no markdown, no backticks:
   "sources": ["list of brands/models referenced in the answer"]
 }
 
-Rules:
-- Use actual numbers from the tool results — no made-up figures
+CRITICAL Rules — faithfulness:
+- ONLY cite ROI values, spend figures, and revenue numbers that appear VERBATIM in the tool results below
+- For benchmark comparisons: read the actual ROI from the mmm_retriever result, then compare it against benchmark_roi_mid and benchmark_p75 from the benchmark_fetcher result
+- If the benchmark_fetcher result shows benchmark_roi_mid=2.7 and the retrieved brand ROI is 2.91, state "2.91x is above the industry midpoint of 2.7x" — do not guess or estimate
+- If data is missing or ambiguous, say so explicitly rather than fabricating a number
+- For cross-brand questions, list each brand and its specific retrieved value individually
 - Keep recommendations specific and actionable
 - If no channel data is available for insights, return an empty insights list
 - narrative should read like a consultant's written analysis
@@ -456,7 +465,7 @@ def run_synthesizer(question: str, execution_log: list[dict]) -> dict:
             "has_chart":    chart_b64 is not None,
         },
     )
-
+    answer["tools_used"] = [e["tool_name"] for e in execution_log]
     answer["chart_b64"] = chart_b64
     return answer
 

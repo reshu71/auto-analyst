@@ -6,6 +6,14 @@ from .config import CURRENT_YEAR, LAST_YEAR, LLM_MODEL
 
 logger = logging.getLogger(__name__)
 
+SUMMARY_KEYWORDS = [
+    "base", "incremental", "r-squared", "mape",
+    "total revenue", "model fit", "overall"
+]
+
+def needs_summary_chunk(question: str) -> bool:
+    q = question.lower()
+    return any(kw in q for kw in SUMMARY_KEYWORDS)
 
 def load_known_entities(collection) -> tuple[set, set]:
     all_metadata = collection.get()["metadatas"]
@@ -15,6 +23,18 @@ def load_known_entities(collection) -> tuple[set, set]:
         if meta.get("channel") and meta["channel"] != "all"
     }
     return brands, channels
+
+
+def build_brand_vertical_map(collection) -> dict:
+    """Returns {brand_name: sub_vertical} from vectorstore metadata."""
+    all_metadata = collection.get()["metadatas"]
+    mapping = {}
+    for meta in all_metadata:
+        brand = meta.get("brand")
+        vertical = meta.get("sub_vertical")
+        if brand and vertical:
+            mapping[brand] = vertical
+    return mapping
 
 
 def regex_parser(question: str, known_brands: set, known_channels: set) -> dict:
@@ -101,15 +121,30 @@ Question: {question}
         return {"brands": set(), "year": None, "channel": set(), "category": None, "sub_vertical": None}
 
 
-def parse_query(question: str, known_brands: set, known_channels: set) -> dict:
+def parse_query(
+    question: str,
+    known_brands: set,
+    known_channels: set,
+    brand_vertical_map: dict = None,
+) -> dict:
     filters = regex_parser(question, known_brands, known_channels)
     if not any(filters.values()):
         logger.debug("Regex found nothing — falling back to LLM parser")
         filters = llm_parser(question, known_brands, known_channels)
+
+    # Infer sub_vertical from detected brand when the question doesn't name one
+    if not filters.get("sub_vertical") and filters.get("brands") and brand_vertical_map:
+        for brand in filters["brands"]:
+            vertical = brand_vertical_map.get(brand)
+            if vertical:
+                filters["sub_vertical"] = vertical
+                logger.debug("Inferred sub_vertical=%r from brand %r", vertical, brand)
+                break
+
     return filters
 
 
-def build_where_clause(filters: dict) -> dict:
+def build_where_clause(filters: dict,question:str) -> dict:
     conditions = []
 
     if filters.get("brands"):
@@ -139,34 +174,37 @@ def build_where_clause(filters: dict) -> dict:
         return {}
     if len(conditions) == 1:
         return conditions[0]
+    if needs_summary_chunk(question):
+        conditions.append({"type": {"$eq": "summary"}})
     return {"$and": conditions}
 
 
-def mmm_retriever(question: str, collection, n_results: int = 10) -> str:
-    known_brands, known_channels = load_known_entities(collection)
-    filters = parse_query(question, known_brands, known_channels)
-    logger.debug("Filters: %s", filters)
+# def mmm_retriever(question: str, collection, n_results: int = 10) -> str:
+#     known_brands, known_channels = load_known_entities(collection)
+#     brand_vertical_map = build_brand_vertical_map(collection)
+#     filters = parse_query(question, known_brands, known_channels, brand_vertical_map)
+#     logger.debug("Filters: %s", filters)
 
-    where = build_where_clause(filters)
-    logger.debug("Where clause: %s", where)
+#     where = build_where_clause(filters, question)
+#     logger.debug("Where clause: %s", where)
 
-    results = collection.query(
-        query_texts=[question],
-        n_results=n_results,
-        **({"where": where} if where else {}),
-    )
+#     results = collection.query(
+#         query_texts=[question],
+#         n_results=n_results,
+#         **({"where": where} if where else {}),
+#     )
 
-    if not results["documents"][0]:
-        return "No relevant MMM data found for this query."
+#     if not results["documents"][0]:
+#         return "No relevant MMM data found for this query."
 
-    parts = []
-    for i, (doc, meta) in enumerate(zip(results["documents"][0], results["metadatas"][0]), 1):
-        parts.append(
-            f"--- Result {i} ---\n"
-            f"Brand: {meta['brand']} | Sub-vertical: {meta['sub_vertical']} | "
-            f"Year: {meta['year']} | Type: {meta['type']}\n"
-            f"Channel: {meta['channel']} | Category: {meta['category']}\n"
-            f"Content: {doc}"
-        )
+#     parts = []
+#     for i, (doc, meta) in enumerate(zip(results["documents"][0], results["metadatas"][0]), 1):
+#         parts.append(
+#             f"--- Result {i} ---\n"
+#             f"Brand: {meta['brand']} | Sub-vertical: {meta['sub_vertical']} | "
+#             f"Year: {meta['year']} | Type: {meta['type']}\n"
+#             f"Channel: {meta['channel']} | Category: {meta['category']}\n"
+#             f"Content: {doc}"
+#         )
 
-    return "\n\n".join(parts)
+#     return "\n\n".join(parts)

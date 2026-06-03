@@ -100,7 +100,12 @@ BENCHMARKS = {
 
 
 # ─── Single Channel Benchmark ─────────────────────────────────────
-def benchmark_fetcher(channel: str, sub_vertical: str, current_roi: float) -> dict:
+def benchmark_fetcher(channel: str, sub_vertical: str, current_roi: float = None) -> dict:
+    """
+    current_roi is optional. When omitted the function returns the industry
+    benchmark ranges without a brand-specific comparison. The synthesizer is
+    responsible for cross-referencing the actual ROI from mmm_retriever results.
+    """
     channel      = channel.lower().strip()
     sub_vertical = sub_vertical.lower().strip()
 
@@ -126,7 +131,37 @@ def benchmark_fetcher(channel: str, sub_vertical: str, current_roi: float) -> di
     roi_high = vertical_benchmarks["roi_high"]
     p75      = vertical_benchmarks["percentile_75"]
 
-    # percentile position
+    engagement = BENCHMARKS.get("engagement", {}).get(channel, {})
+
+    # Base result always includes the benchmark ranges so the synthesizer can
+    # compare against whatever actual ROI was retrieved by mmm_retriever.
+    result = {
+        "status":                "found",
+        "channel":               channel,
+        "sub_vertical":          sub_vertical,
+        "benchmark_roi_low":     roi_low,
+        "benchmark_roi_mid":     roi_mid,
+        "benchmark_roi_high":    roi_high,
+        "benchmark_p75":         p75,
+        "engagement_benchmarks": engagement,
+        "data_source":           BENCHMARKS["source"],
+        "note": (
+            "Use the actual ROI from mmm_retriever results to determine the "
+            "brand's position relative to these benchmark ranges."
+        ),
+    }
+
+    if current_roi is None or current_roi <= 0:
+        # Return ranges only — synthesizer will do the comparison
+        result["current_roi"] = None
+        result["insight"] = (
+            f"{channel.title()} industry benchmarks for {sub_vertical}: "
+            f"low={roi_low}x, median={roi_mid}x, 75th pct={p75}x, high={roi_high}x. "
+            f"Compare the brand's actual ROI (from retrieved MMM data) against these ranges."
+        )
+        return result
+
+    # percentile position when current_roi is known
     if current_roi >= roi_high:
         percentile_position = "top quartile (>75th percentile)"
         performance_label   = "outperformer"
@@ -146,7 +181,6 @@ def benchmark_fetcher(channel: str, sub_vertical: str, current_roi: float) -> di
     gap_to_median = round(roi_mid - current_roi, 2)
     gap_to_p75    = round(p75 - current_roi, 2)
 
-    # plain English insight for synthesizer
     if current_roi >= roi_mid:
         insight = (
             f"{channel.title()} ROI of {current_roi}x is above the industry median "
@@ -160,34 +194,28 @@ def benchmark_fetcher(channel: str, sub_vertical: str, current_roi: float) -> di
             f"Investigate creative quality, targeting, or frequency before increasing spend."
         )
 
-    engagement = BENCHMARKS.get("engagement", {}).get(channel, {})
-
-    return {
-        "status":                "found",
-        "channel":               channel,
-        "sub_vertical":          sub_vertical,
-        "current_roi":           current_roi,
-        "benchmark_roi_low":     roi_low,
-        "benchmark_roi_mid":     roi_mid,
-        "benchmark_roi_high":    roi_high,
-        "benchmark_p75":         p75,
-        "gap_to_median":         gap_to_median,
-        "gap_to_p75":            gap_to_p75,
-        "percentile_position":   percentile_position,
-        "performance_label":     performance_label,
-        "insight":               insight,
-        "engagement_benchmarks": engagement,
-        "data_source":           BENCHMARKS["source"],
-    }
+    result.update({
+        "current_roi":         current_roi,
+        "gap_to_median":       gap_to_median,
+        "gap_to_p75":          gap_to_p75,
+        "percentile_position": percentile_position,
+        "performance_label":   performance_label,
+        "insight":             insight,
+    })
+    return result
 
 
 # ─── Batch — compare all channels in one MMM output ───────────────
 def benchmark_all_channels(channels: list, sub_vertical: str) -> list:
+    """
+    channels: list of {"name": str} or {"name": str, "roi": float}.
+    roi is optional — omit it when the actual ROI should come from mmm_retriever.
+    """
     return [
         benchmark_fetcher(
             channel=ch["name"],
             sub_vertical=sub_vertical,
-            current_roi=ch["roi"]
+            current_roi=ch.get("roi"),
         )
         for ch in channels
     ]
